@@ -1,1 +1,557 @@
 
+# ============================================================
+# AI PATHFINDER - PART 1: Core Logic & Algorithms
+# GOOD PERFORMANCE TIME APP
+# ============================================================
+# HOW TO RUN:
+#   pip install pygame
+#   Make sure pathfinder_part2.py is in the SAME folder
+#   Then run: python pathfinder_part2.py
+#
+# This file contains:
+#   - Grid class (manages cells, walls, dynamic obstacles)
+#   - All 6 search algorithms (BFS, DFS, UCS, DLS, IDDFS, Bidirectional)
+#   - Node class for tracking search state
+# ============================================================
+
+import random
+from collections import deque
+import heapq
+
+# ──────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────
+ROWS = 15          # number of grid rows
+COLS = 20          # number of grid columns
+
+# Cell type identifiers
+EMPTY    = 0
+WALL     = -1
+START    = 1       # stored as integer in grid; rendered as 'S'
+TARGET   = 2       # stored as integer in grid; rendered as 'T'
+
+# Movement directions (Clockwise + both main diagonals)
+# Order: Up, Right, Down, Bottom-Right, Left, Top-Left, Top-Right, Bottom-Left
+DIRECTIONS = [
+    (-1,  0),   # Up
+    ( 0,  1),   # Right
+    ( 1,  0),   # Down
+    ( 1,  1),   # Bottom-Right  (diagonal)
+    ( 0, -1),   # Left
+    (-1, -1),   # Top-Left      (diagonal)
+    (-1,  1),   # Top-Right     (diagonal)
+    ( 1, -1),   # Bottom-Left   (diagonal)
+]
+
+# Dynamic obstacle probability per algorithm step (0–1)
+OBSTACLE_PROB = 0.03   # 3% chance each step a new wall spawns
+
+
+# ──────────────────────────────────────────────
+# NODE  (used by search algorithms)
+# ──────────────────────────────────────────────
+class Node:
+    """
+    Represents a single cell in the search tree.
+    parent  – the Node we came from (used to reconstruct the path)
+    cost    – cumulative cost to reach this node (used by UCS)
+    depth   – depth from the start (used by DLS / IDDFS)
+    """
+    def __init__(self, row, col, parent=None, cost=0, depth=0):
+        self.row    = row
+        self.col    = col
+        self.parent = parent
+        self.cost   = cost
+        self.depth  = depth
+
+    # ── needed so Nodes can live inside a heap (UCS) ──
+    def __lt__(self, other):
+        return self.cost < other.cost
+
+    def __eq__(self, other):
+        return (self.row, self.col) == (other.row, other.col)
+
+    def __hash__(self):
+        return hash((self.row, self.col))
+
+    def position(self):
+        return (self.row, self.col)
+
+
+# ──────────────────────────────────────────────
+# GRID
+# ──────────────────────────────────────────────
+class Grid:
+    """
+    Holds the 2-D grid and all related helpers.
+
+    grid[row][col] values:
+        EMPTY (0)  – free cell
+        WALL (-1)  – blocked cell
+        START (1)  – start position
+        TARGET(2)  – target position
+    """
+
+    def __init__(self, rows=ROWS, cols=COLS):
+        self.rows  = rows
+        self.cols  = cols
+        self.grid  = [[EMPTY] * cols for _ in range(rows)]
+
+        # default positions
+        self.start  = (7, 1)
+        self.target = (7, 18)
+
+        self._place_defaults()
+
+    # ── place S / T and a simple demo wall ──────────────
+    def _place_defaults(self):
+        sr, sc = self.start
+        tr, tc = self.target
+        self.grid[sr][sc] = START
+        self.grid[tr][tc] = TARGET
+
+        # A vertical wall in the middle to make things interesting
+        wall_col = self.cols // 2
+        for r in range(2, self.rows - 2):
+            if (r, wall_col) not in (self.start, self.target):
+                self.grid[r][wall_col] = WALL
+
+    # ── reset entire grid ────────────────────────────────
+    def reset(self):
+        self.grid = [[EMPTY] * self.cols for _ in range(self.rows)]
+        self._place_defaults()
+
+    # ── convenience: is a cell inside the grid? ──────────
+    def in_bounds(self, row, col):
+        return 0 <= row < self.rows and 0 <= col < self.cols
+
+    # ── is a cell passable (not a wall)? ─────────────────
+    def is_passable(self, row, col):
+        return self.in_bounds(row, col) and self.grid[row][col] != WALL
+
+    # ── get valid neighbors (respects DIRECTIONS order) ──
+    def neighbors(self, row, col):
+        result = []
+        for dr, dc in DIRECTIONS:
+            nr, nc = row + dr, col + dc
+            if self.is_passable(nr, nc):
+                result.append((nr, nc))
+        return result
+
+    # ── place / remove a wall manually ───────────────────
+    def toggle_wall(self, row, col):
+        if (row, col) in (self.start, self.target):
+            return   # never overwrite S or T
+        if self.grid[row][col] == WALL:
+            self.grid[row][col] = EMPTY
+        else:
+            self.grid[row][col] = WALL
+
+    # ── try to spawn a random dynamic obstacle ───────────
+    def try_spawn_obstacle(self, protected_cells):
+        """
+        With probability OBSTACLE_PROB, place a wall on a random
+        empty cell that is NOT in protected_cells (start, target,
+        current path, etc.).
+        Returns (row, col) of new wall, or None.
+        """
+        if random.random() > OBSTACLE_PROB:
+            return None
+
+        empty_cells = [
+            (r, c)
+            for r in range(self.rows)
+            for c in range(self.cols)
+            if self.grid[r][c] == EMPTY
+            and (r, c) not in protected_cells
+        ]
+        if not empty_cells:
+            return None
+
+        r, c = random.choice(empty_cells)
+        self.grid[r][c] = WALL
+        return (r, c)
+
+    # ── set start / target programmatically ──────────────
+    def set_start(self, row, col):
+        old_r, old_c = self.start
+        self.grid[old_r][old_c] = EMPTY
+        self.start = (row, col)
+        self.grid[row][col] = START
+
+    def set_target(self, row, col):
+        old_r, old_c = self.target
+        self.grid[old_r][old_c] = EMPTY
+        self.target = (row, col)
+        self.grid[row][col] = TARGET
+
+
+# ──────────────────────────────────────────────
+# PATH RECONSTRUCTION HELPER
+# ──────────────────────────────────────────────
+def reconstruct_path(node):
+    """Walk parent pointers back to the start and return the list of
+    (row, col) positions from start → goal."""
+    path = []
+    current = node
+    while current is not None:
+        path.append(current.position())
+        current = current.parent
+    path.reverse()
+    return path
+
+
+# ══════════════════════════════════════════════
+# SEARCH ALGORITHMS
+# Each algorithm is a Python *generator* function.
+# Every time we call next() on it, it yields ONE step of the search.
+# This lets the GUI draw each step without blocking.
+#
+# Each yield produces a dict:
+#   {
+#     "frontier"  : set of (r,c) currently waiting to be explored
+#     "explored"  : set of (r,c) already visited
+#     "path"      : list of (r,c) if solution found, else []
+#     "found"     : True / False
+#     "failed"    : True if no solution exists
+#     "message"   : short status string
+#   }
+# ══════════════════════════════════════════════
+
+# ──────────────────────────────────────────────
+# 1. BREADTH-FIRST SEARCH (BFS)
+# ──────────────────────────────────────────────
+def bfs(grid: Grid):
+    """
+    BFS explores the grid level by level (closest cells first).
+    Guaranteed to find the SHORTEST path (fewest hops).
+    Uses a queue (FIFO).
+    """
+    start_node = Node(*grid.start)
+    queue      = deque([start_node])   # FIFO queue
+    explored   = set()
+    explored.add(grid.start)
+
+    while queue:
+        # --- dynamic obstacle spawn ---
+        protected = explored | {n.position() for n in queue}
+        protected.add(grid.target)
+        grid.try_spawn_obstacle(protected)
+
+        current = queue.popleft()
+
+        # ── goal check ──
+        if current.position() == grid.target:
+            path = reconstruct_path(current)
+            yield {"frontier": set(), "explored": explored,
+                   "path": path, "found": True, "failed": False,
+                   "message": f"BFS: Path found! Length = {len(path)}"}
+            return
+
+        # ── expand neighbors ──
+        for nr, nc in grid.neighbors(current.row, current.col):
+            if (nr, nc) not in explored:
+                explored.add((nr, nc))
+                child = Node(nr, nc, parent=current)
+                queue.append(child)
+
+        frontier = {n.position() for n in queue}
+        yield {"frontier": frontier, "explored": explored,
+               "path": [], "found": False, "failed": False,
+               "message": "BFS: Searching…"}
+
+    yield {"frontier": set(), "explored": explored,
+           "path": [], "found": False, "failed": True,
+           "message": "BFS: No path found!"}
+
+
+# ──────────────────────────────────────────────
+# 2. DEPTH-FIRST SEARCH (DFS)
+# ──────────────────────────────────────────────
+def dfs(grid: Grid):
+    """
+    DFS dives as deep as possible before backtracking.
+    Uses a stack (LIFO). Does NOT guarantee shortest path.
+    """
+    start_node = Node(*grid.start)
+    stack      = [start_node]          # LIFO stack
+    explored   = set()
+
+    while stack:
+        protected = explored | {n.position() for n in stack}
+        protected.add(grid.target)
+        grid.try_spawn_obstacle(protected)
+
+        current = stack.pop()
+
+        if current.position() in explored:
+            continue
+        explored.add(current.position())
+
+        if current.position() == grid.target:
+            path = reconstruct_path(current)
+            yield {"frontier": set(), "explored": explored,
+                   "path": path, "found": True, "failed": False,
+                   "message": f"DFS: Path found! Length = {len(path)}"}
+            return
+
+        for nr, nc in grid.neighbors(current.row, current.col):
+            if (nr, nc) not in explored:
+                child = Node(nr, nc, parent=current)
+                stack.append(child)
+
+        frontier = {n.position() for n in stack}
+        yield {"frontier": frontier, "explored": explored,
+               "path": [], "found": False, "failed": False,
+               "message": "DFS: Searching…"}
+
+    yield {"frontier": set(), "explored": explored,
+           "path": [], "found": False, "failed": True,
+           "message": "DFS: No path found!"}
+
+
+# ──────────────────────────────────────────────
+# 3. UNIFORM-COST SEARCH (UCS)
+# ──────────────────────────────────────────────
+def ucs(grid: Grid):
+    """
+    UCS always expands the cheapest node first.
+    Diagonal moves cost √2 ≈ 1.414; straight moves cost 1.
+    Guaranteed optimal with non-uniform costs.
+    Uses a min-heap (priority queue).
+    """
+    start_node = Node(*grid.start, cost=0)
+    heap       = [start_node]          # min-heap ordered by cost
+    explored   = {}                    # position → best cost seen
+
+    while heap:
+        protected = set(explored.keys())
+        protected.add(grid.target)
+        grid.try_spawn_obstacle(protected)
+
+        current = heapq.heappop(heap)
+
+        if current.position() in explored:
+            continue
+        explored[current.position()] = current.cost
+
+        if current.position() == grid.target:
+            path = reconstruct_path(current)
+            yield {"frontier": {n.position() for n in heap},
+                   "explored": set(explored.keys()),
+                   "path": path, "found": True, "failed": False,
+                   "message": f"UCS: Path found! Cost = {current.cost:.2f}"}
+            return
+
+        for nr, nc in grid.neighbors(current.row, current.col):
+            if (nr, nc) not in explored:
+                # diagonal move costs √2, straight costs 1
+                dr = abs(nr - current.row)
+                dc = abs(nc - current.col)
+                step_cost = 1.414 if (dr == 1 and dc == 1) else 1.0
+                new_cost  = current.cost + step_cost
+                child     = Node(nr, nc, parent=current, cost=new_cost)
+                heapq.heappush(heap, child)
+
+        yield {"frontier": {n.position() for n in heap},
+               "explored": set(explored.keys()),
+               "path": [], "found": False, "failed": False,
+               "message": "UCS: Searching…"}
+
+    yield {"frontier": set(), "explored": set(explored.keys()),
+           "path": [], "found": False, "failed": True,
+           "message": "UCS: No path found!"}
+
+
+# ──────────────────────────────────────────────
+# 4. DEPTH-LIMITED SEARCH (DLS)
+# ──────────────────────────────────────────────
+def dls(grid: Grid, depth_limit=20):
+    """
+    DLS is DFS with a hard depth cutoff.
+    Prevents infinite loops in deep/infinite spaces.
+    May MISS the goal if limit is too small.
+    """
+    start_node = Node(*grid.start, depth=0)
+    stack      = [start_node]
+    explored   = set()
+
+    while stack:
+        protected = explored | {n.position() for n in stack}
+        protected.add(grid.target)
+        grid.try_spawn_obstacle(protected)
+
+        current = stack.pop()
+
+        if current.position() in explored:
+            continue
+        explored.add(current.position())
+
+        if current.position() == grid.target:
+            path = reconstruct_path(current)
+            yield {"frontier": set(), "explored": explored,
+                   "path": path, "found": True, "failed": False,
+                   "message": f"DLS: Path found at depth {current.depth}!"}
+            return
+
+        # only expand if we haven't hit the depth limit
+        if current.depth < depth_limit:
+            for nr, nc in grid.neighbors(current.row, current.col):
+                if (nr, nc) not in explored:
+                    child = Node(nr, nc, parent=current,
+                                 depth=current.depth + 1)
+                    stack.append(child)
+
+        frontier = {n.position() for n in stack}
+        yield {"frontier": frontier, "explored": explored,
+               "path": [], "found": False, "failed": False,
+               "message": f"DLS (limit={depth_limit}): Searching…"}
+
+    yield {"frontier": set(), "explored": explored,
+           "path": [], "found": False, "failed": True,
+           "message": f"DLS: No path within depth {depth_limit}!"}
+
+
+# ──────────────────────────────────────────────
+# 5. ITERATIVE DEEPENING DFS (IDDFS)
+# ──────────────────────────────────────────────
+def iddfs(grid: Grid, max_depth=50):
+    """
+    IDDFS runs DLS repeatedly, increasing the depth limit by 1 each time.
+    Combines BFS's completeness with DFS's low memory usage.
+    """
+    for limit in range(1, max_depth + 1):
+        stack    = [Node(*grid.start, depth=0)]
+        explored = set()
+
+        while stack:
+            protected = explored | {n.position() for n in stack}
+            protected.add(grid.target)
+            grid.try_spawn_obstacle(protected)
+
+            current = stack.pop()
+
+            if current.position() in explored:
+                continue
+            explored.add(current.position())
+
+            if current.position() == grid.target:
+                path = reconstruct_path(current)
+                yield {"frontier": set(), "explored": explored,
+                       "path": path, "found": True, "failed": False,
+                       "message": f"IDDFS: Found at depth limit {limit}!"}
+                return
+
+            if current.depth < limit:
+                for nr, nc in grid.neighbors(current.row, current.col):
+                    if (nr, nc) not in explored:
+                        child = Node(nr, nc, parent=current,
+                                     depth=current.depth + 1)
+                        stack.append(child)
+
+            frontier = {n.position() for n in stack}
+            yield {"frontier": frontier, "explored": explored,
+                   "path": [], "found": False, "failed": False,
+                   "message": f"IDDFS: Depth limit = {limit}…"}
+
+    yield {"frontier": set(), "explored": set(),
+           "path": [], "found": False, "failed": True,
+           "message": "IDDFS: No path found!"}
+
+
+# ──────────────────────────────────────────────
+# 6. BIDIRECTIONAL SEARCH
+# ──────────────────────────────────────────────
+def bidirectional(grid: Grid):
+    """
+    Bidirectional BFS launches two simultaneous BFS waves —
+    one from Start, one from Target — and stops when they meet.
+    Dramatically reduces explored nodes compared to plain BFS.
+    """
+    # Forward frontier (from start)
+    fwd_queue    = deque([Node(*grid.start)])
+    fwd_explored = {grid.start: Node(*grid.start)}
+
+    # Backward frontier (from target)
+    bwd_queue    = deque([Node(*grid.target)])
+    bwd_explored = {grid.target: Node(*grid.target)}
+
+    def _build_path(meeting_fwd, meeting_bwd):
+        """Stitch the two half-paths together."""
+        path_fwd = reconstruct_path(meeting_fwd)   # start → meeting
+        path_bwd = reconstruct_path(meeting_bwd)   # target → meeting
+        path_bwd.reverse()                         # meeting → target
+        # Remove duplicated meeting point
+        return path_fwd + path_bwd[1:]
+
+    while fwd_queue or bwd_queue:
+        protected = (set(fwd_explored) | set(bwd_explored))
+        protected.add(grid.start)
+        protected.add(grid.target)
+        grid.try_spawn_obstacle(protected)
+
+        # ── forward step ──
+        if fwd_queue:
+            current_fwd = fwd_queue.popleft()
+
+            # check if this node was already reached by the backward wave
+            if current_fwd.position() in bwd_explored:
+                path = _build_path(current_fwd,
+                                   bwd_explored[current_fwd.position()])
+                yield {"frontier": {n.position() for n in fwd_queue} |
+                                   {n.position() for n in bwd_queue},
+                       "explored": set(fwd_explored) | set(bwd_explored),
+                       "path": path, "found": True, "failed": False,
+                       "message": f"Bidirectional: Met! Path length = {len(path)}"}
+                return
+
+            for nr, nc in grid.neighbors(current_fwd.row, current_fwd.col):
+                if (nr, nc) not in fwd_explored:
+                    child = Node(nr, nc, parent=current_fwd)
+                    fwd_explored[(nr, nc)] = child
+                    fwd_queue.append(child)
+
+        # ── backward step ──
+        if bwd_queue:
+            current_bwd = bwd_queue.popleft()
+
+            if current_bwd.position() in fwd_explored:
+                path = _build_path(fwd_explored[current_bwd.position()],
+                                   current_bwd)
+                yield {"frontier": {n.position() for n in fwd_queue} |
+                                   {n.position() for n in bwd_queue},
+                       "explored": set(fwd_explored) | set(bwd_explored),
+                       "path": path, "found": True, "failed": False,
+                       "message": f"Bidirectional: Met! Path length = {len(path)}"}
+                return
+
+            for nr, nc in grid.neighbors(current_bwd.row, current_bwd.col):
+                if (nr, nc) not in bwd_explored:
+                    child = Node(nr, nc, parent=current_bwd)
+                    bwd_explored[(nr, nc)] = child
+                    bwd_queue.append(child)
+
+        yield {"frontier": {n.position() for n in fwd_queue} |
+                           {n.position() for n in bwd_queue},
+               "explored": set(fwd_explored) | set(bwd_explored),
+               "path": [], "found": False, "failed": False,
+               "message": "Bidirectional: Expanding from both ends…"}
+
+    yield {"frontier": set(),
+           "explored": set(fwd_explored) | set(bwd_explored),
+           "path": [], "found": False, "failed": True,
+           "message": "Bidirectional: No path found!"}
+
+
+# ──────────────────────────────────────────────
+# ALGORITHM REGISTRY
+# Makes it easy for Part 2 (GUI) to look up any algorithm by name
+# ──────────────────────────────────────────────
+ALGORITHMS = {
+    "BFS":           bfs,
+    "DFS":           dfs,
+    "UCS":           ucs,
+    "DLS":           dls,
+    "IDDFS":         iddfs,
+    "Bidirectional": bidirectional,
+}
